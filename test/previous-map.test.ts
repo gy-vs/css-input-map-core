@@ -4,18 +4,21 @@ import {
   mkdirSync,
   readdirSync,
   rmdirSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync
 } from 'fs'
-import { join } from 'path'
+import { join, sep } from 'path'
 import { SourceMapConsumer } from 'source-map-js'
 import { pathToFileURL } from 'url'
 import { test } from 'uvu'
 import { equal, is, match, not, throws, type } from 'uvu/assert'
 
 import { parse } from '../lib/postcss.js'
+import PreviousMap from '../lib/previous-map.js'
 
 let dir = join(__dirname, 'prevmap-fixtures')
+let outsideDir = join(__dirname, 'prevmap-outside-fixtures')
 let mapObj = {
   file: null,
   mappings: '',
@@ -41,6 +44,7 @@ function deleteDir(path: string): void {
 
 test.after.each(() => {
   deleteDir(dir)
+  deleteDir(outsideDir)
 })
 
 test('misses property if no map', () => {
@@ -338,6 +342,130 @@ test('loads map from outside the from folder with unsafeMap', () => {
     unsafeMap: true
   }).source?.input
   is(input?.map.text, map)
+})
+
+test('does not load map from a symlink outside the from folder', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  mkdirSync(outsideDir)
+  let secretPath = join(outsideDir, 'secret.map')
+  writeFileSync(secretPath, JSON.stringify({ secret: 'do-not-leak' }))
+  let linkPath = join(dir, 'link.map')
+  symlinkSync(secretPath, linkPath)
+
+  let input = parse('a{}\n/*# sourceMappingURL=link.map */', {
+    from
+  }).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('loads map from a symlink inside the from folder', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  mkdirSync(join(dir, 'maps'))
+  let targetPath = join(dir, 'maps', 'real.map')
+  writeFileSync(targetPath, map)
+  let linkPath = join(dir, 'link.map')
+  symlinkSync(targetPath, linkPath)
+
+  let input = parse('a{}\n/*# sourceMappingURL=link.map */', {
+    from
+  }).source?.input
+  is(input?.map.text, map)
+})
+
+test('does not crash on a broken symlink map', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  mkdirSync(outsideDir)
+  symlinkSync(join(outsideDir, 'missing.map'), join(dir, 'broken.map'))
+
+  let input = parse('a{}\n/*# sourceMappingURL=broken.map */', {
+    from
+  }).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('does not crash on a symlink cycle map', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  symlinkSync(join(dir, 'b.map'), join(dir, 'a.map'))
+  symlinkSync(join(dir, 'a.map'), join(dir, 'b.map'))
+
+  let input = parse('a{}\n/*# sourceMappingURL=a.map */', {
+    from
+  }).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('does not load map through symlinked folder outside from folder', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  mkdirSync(outsideDir)
+  writeFileSync(join(outsideDir, 'secret.map'), map)
+  // The last path component is a regular file name, but a middle
+  // component is a symlink escaping the CSS file’s directory.
+  symlinkSync(outsideDir, join(dir, 'linked-folder'))
+
+  let input = parse(
+    'a{}\n/*# sourceMappingURL=linked-folder/secret.map */',
+    { from }
+  ).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('loads map through a symlinked folder inside the from folder', () => {
+  let from = join(dir, 'a.css')
+  mkdirSync(dir)
+  mkdirSync(join(dir, 'maps'))
+  writeFileSync(join(dir, 'maps', 'real.map'), map)
+  symlinkSync(join(dir, 'maps'), join(dir, 'linked-folder'))
+
+  let input = parse(
+    'a{}\n/*# sourceMappingURL=linked-folder/real.map */',
+    { from }
+  ).source?.input
+  is(input?.map.text, map)
+})
+
+test('does not load map when the CSS directory does not exist', () => {
+  mkdirSync(outsideDir)
+  writeFileSync(join(outsideDir, 'outside.map'), map)
+  let from = join(dir, 'missing', 'a.css')
+
+  let input = parse(
+    'a{}\n/*# sourceMappingURL=../../prevmap-outside-fixtures/outside.map */',
+    { from }
+  ).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('checks that a map is inside its CSS directory case-insensitively', () => {
+  let checker: any = new PreviousMap('', { map: false })
+  let root = join(sep, 'project', 'styles')
+
+  is(checker.isInsideDir(root, join(root, 'a.map')), true)
+  is(checker.isInsideDir(root, join(sep, 'other', 'a.map')), false)
+  is(checker.isInsideDir(root, root), false)
+  is(checker.isInsideDir(root, join(root, '..', 'a.map')), false)
+  // Case-insensitive file systems (Windows, default macOS) must treat
+  // differently cased spellings of the same directory as equal.
+  is(
+    checker.isInsideDir(
+      join(sep, 'Project', 'Styles'),
+      join(sep, 'project', 'styles', 'a.map'),
+      true
+    ),
+    true
+  )
+  // The check stays case-sensitive when the file system is.
+  is(
+    checker.isInsideDir(
+      join(sep, 'Project', 'Styles'),
+      join(sep, 'project', 'styles', 'a.map')
+    ),
+    false
+  )
 })
 
 test('uses current file path for source map', () => {
