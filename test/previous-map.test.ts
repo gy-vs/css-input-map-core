@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   rmdirSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync
 } from 'fs'
@@ -16,6 +17,7 @@ import { equal, is, match, not, throws, type } from 'uvu/assert'
 import { parse } from '../lib/postcss.js'
 
 let dir = join(__dirname, 'prevmap-fixtures')
+let outsideDir = join(__dirname, 'prevmap-outside-fixtures')
 let mapObj = {
   file: null,
   mappings: '',
@@ -24,6 +26,27 @@ let mapObj = {
   version: 3
 }
 let map = JSON.stringify(mapObj)
+let secret = JSON.stringify({
+  mappings: 'SECRET-CONTENT',
+  names: [],
+  sources: [],
+  version: 3
+})
+
+// Creating symlinks is not permitted on Windows without developer mode
+// or administrator privileges.
+let symlinksSupported = true
+function makeSymlink(
+  target: string,
+  path: string,
+  kind: 'dir' | 'file' | 'junction' | null = 'file'
+): void {
+  try {
+    symlinkSync(target, path, kind)
+  } catch {
+    symlinksSupported = false
+  }
+}
 
 function deleteDir(path: string): void {
   if (existsSync(path)) {
@@ -41,6 +64,7 @@ function deleteDir(path: string): void {
 
 test.after.each(() => {
   deleteDir(dir)
+  deleteDir(outsideDir)
 })
 
 test('misses property if no map', () => {
@@ -406,6 +430,95 @@ test('works with index map', () => {
     }
   })
   is((root as any).source.input.origin(1, 2).file, join(__dirname, 'b.css'))
+})
+
+test('does not load map through a symlink pointing outside the folder', () => {
+  mkdirSync(dir)
+  mkdirSync(outsideDir)
+  writeFileSync(join(outsideDir, 'secret.map'), secret)
+  makeSymlink(
+    join(outsideDir, 'secret.map'),
+    join(dir, 'linked.map')
+  )
+  if (!symlinksSupported) return
+
+  let from = join(dir, 'a.css')
+  let input = parse('a{}\n/*# sourceMappingURL=linked.map */', { from })
+    .source?.input
+  type(input?.map, 'undefined')
+})
+
+test('loads map through a symlink pointing inside the folder', () => {
+  mkdirSync(dir)
+  writeFileSync(join(dir, 'actual.map'), map)
+  makeSymlink('actual.map', join(dir, 'linked.map'))
+  if (!symlinksSupported) return
+
+  let root = parse('a{}\n/*# sourceMappingURL=linked.map */', {
+    from: join(dir, 'a.css')
+  })
+  is(root.source?.input.map.text, map)
+})
+
+test('does not throw on a broken symlink map', () => {
+  mkdirSync(dir)
+  makeSymlink(join(dir, 'missing.map'), join(dir, 'broken.map'))
+  if (!symlinksSupported) return
+
+  let input: any
+  not.throws(() => {
+    input = parse('a{}\n/*# sourceMappingURL=broken.map */', {
+      from: join(dir, 'a.css')
+    }).source?.input
+  })
+  type(input?.map, 'undefined')
+})
+
+test('does not throw on a symlink loop map', () => {
+  mkdirSync(dir)
+  makeSymlink(join(dir, 'loop-b.map'), join(dir, 'loop-a.map'))
+  makeSymlink(join(dir, 'loop-a.map'), join(dir, 'loop-b.map'))
+  if (!symlinksSupported) return
+
+  let input: any
+  not.throws(() => {
+    input = parse('a{}\n/*# sourceMappingURL=loop-a.map */', {
+      from: join(dir, 'a.css')
+    }).source?.input
+  })
+  type(input?.map, 'undefined')
+})
+
+test('does not load map through a symlink in the middle of the path', () => {
+  mkdirSync(dir)
+  mkdirSync(outsideDir)
+  writeFileSync(join(outsideDir, 'secret.map'), secret)
+  makeSymlink(outsideDir, join(dir, 'linked'), 'junction')
+  if (!symlinksSupported) return
+
+  let from = join(dir, 'a.css')
+  let input = parse('a{}\n/*# sourceMappingURL=linked/secret.map */', {
+    from
+  }).source?.input
+  type(input?.map, 'undefined')
+})
+
+test('checks real location when directory names have no letters', () => {
+  let numeric = join(dir, '123')
+  mkdirSync(dir)
+  mkdirSync(numeric)
+  mkdirSync(outsideDir)
+  writeFileSync(join(outsideDir, 'secret.map'), secret)
+  makeSymlink(
+    join(outsideDir, 'secret.map'),
+    join(numeric, 'linked.map')
+  )
+  if (!symlinksSupported) return
+
+  let input = parse('a{}\n/*# sourceMappingURL=linked.map */', {
+    from: join(numeric, 'a.css')
+  }).source?.input
+  type(input?.map, 'undefined')
 })
 
 test.run()
